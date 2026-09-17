@@ -35,27 +35,9 @@ https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_C
 # --- drop back to the unprivileged jenkins user for everything else
 USER jenkins
 
-# Plugins installed at build time so the instance comes up ready and
-# reproducible, instead of relying on someone clicking through the UI.
-#   workflow-aggregator ... declarative Pipeline
-#   docker-workflow ...... docker{} / docker.build() steps
-#   git, github .......... SCM checkout and polling
-#   credentials-binding .. withCredentials() for the registry and scanner tokens
-#   matrix-auth .......... per-user authorisation matrix (Task 2 hardening)
-#   junit ................ test result trends
-#   timestamper .......... timestamps in console logs (Task 4 logging)
-#   audit-trail .......... who changed what, when (Task 4 monitoring)
-#   warnings-ng .......... annotated static-analysis / scanner reports
-#   ws-cleanup ........... workspace cleanup in post{}
-RUN jenkins-plugin-cli --plugins \
-      "workflow-aggregator \
-       docker-workflow \
-       git \
-       github \
-       credentials-binding \
-       matrix-auth \
-       junit \
-       timestamper \
-       audit-trail \
-       warnings-ng \
-       ws-cleanup"
+# Plugins are NOT baked into this image. jenkins-plugin-cli resolves the full
+# dependency tree against the update centre at build time, so a single plugin
+# that cannot be satisfied fails the entire image build - an unnecessarily
+# fragile coupling between the image and an external service. Plugins are
+# installed through the setup wizard and Plugin Manager as a documented
+# post-install step instead; see README.md for the required list.
