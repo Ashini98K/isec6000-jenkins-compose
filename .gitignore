@@ -1,0 +1,8 @@
+.env
+*.pem
+*.key
+*.crt
+certs/
+docs/**/*.tmp
+.DS_Store
+Thumbs.db
