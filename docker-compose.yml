@@ -1,0 +1,159 @@
+# =============================================================================
+#  ISEC6000 Secure DevOps - Assessment 2
+#  Containerised Jenkins CI/CD environment with an isolated Docker-in-Docker
+#  (DinD) build daemon.
+#
+#  DESIGN INTENT
+#  -------------
+#  Jenkins pipelines need to build and push Docker images. The common shortcut
+#  is to bind-mount the host's Docker socket (-v /var/run/docker.sock) into the
+#  Jenkins container. That is convenient and insecure: any pipeline step - and
+#  therefore any commit pushed to the repository - gains effective root on the
+#  host, because it can start a privileged container with the host filesystem
+#  mounted.
+#
+#  This stack instead runs a SEPARATE Docker daemon in its own container and
+#  has Jenkins talk to it over a mutually authenticated TLS connection on an
+#  internal network. The blast radius of a compromised pipeline is that one
+#  daemon container, not the host.
+#
+#  USAGE
+#  -----
+#     cp .env.example .env          # then edit if you need a different port
+#     docker compose up -d --build
+#     docker compose logs jenkins   # read the initial admin password
+#     ssh -L 8080:127.0.0.1:8080 user@server   # reach the UI from your laptop
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  dind - the Docker daemon that pipeline stages build images on.
+  # ---------------------------------------------------------------------------
+  dind:
+    image: docker:25-dind
+    container_name: isec6000-dind
+    restart: unless-stopped
+
+    # The daemon manages cgroups, namespaces and the overlay filesystem, which
+    # requires elevated kernel capabilities. This is the one privileged
+    # component in the stack and it is deliberately isolated: it publishes no
+    # host ports, sits on an internal-facing network, and holds no credentials.
+    privileged: true
+
+    # Tells the daemon to generate its own CA, server certificate and client
+    # certificate under /certs and to require TLS on port 2376. Without this
+    # the daemon would expose an unauthenticated TCP socket - anyone who could
+    # reach it would own the build environment.
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+
+    # overlay2 is the supported storage driver for DinD; naming it explicitly
+    # avoids the daemon falling back to the very slow vfs driver.
+    command: ["--storage-driver=overlay2"]
+
+    volumes:
+      # Client certificate material, shared read-only with the controller so it
+      # can authenticate to this daemon.
+      - jenkins-certs:/certs/client
+      # The controller's home is mounted here as well. Pipeline stages run
+      # `docker build` with a build context that lives in a Jenkins workspace,
+      # and the daemon reads that context from its own filesystem - so both
+      # containers must see the workspace at the same path.
+      - jenkins-data:/var/jenkins_home
+      # Image layers and the build cache. Kept on a separate volume so pruning
+      # build junk never risks the Jenkins configuration, and so the 10 GB disk
+      # budget is easy to reason about.
+      - build-cache:/var/lib/docker
+
+    # Reachable only from the internal network, never from the host.
+    expose:
+      - "2376"
+
+    networks:
+      ci:
+        aliases:
+          # The controller connects to tcp://docker:2376. The alias is what
+          # makes that hostname resolve.
+          - docker
+
+  # ---------------------------------------------------------------------------
+  #  jenkins - the controller (UI, job configuration, build history, logs).
+  # ---------------------------------------------------------------------------
+  jenkins:
+    build:
+      context: ./jenkins        # see jenkins/Dockerfile - adds the Docker CLI
+                                # and pre-installs the required plugins
+    image: isec6000/jenkins-controller:local
+    container_name: isec6000-jenkins
+    restart: unless-stopped
+
+    depends_on:
+      - dind
+
+    environment:
+      # Point every `docker` command the controller runs at the DinD daemon
+      # rather than a local socket (there isn't one inside this container).
+      DOCKER_HOST: tcp://docker:2376
+      # Require TLS and verify the daemon's certificate against the shared CA.
+      # Dropping either of these two lines silently downgrades the connection.
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+      # Keep the setup wizard on - it forces creation of a real admin account
+      # instead of leaving the instance open. Signature checking on plugin
+      # downloads stays enabled (the default) for supply-chain integrity.
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=true
+        -Dhudson.model.DownloadService.noSignatureCheck=false
+
+    ports:
+      # Bound to loopback by default (see .env.example). The Jenkins UI is an
+      # administrative interface and a remote-code-execution surface by design,
+      # so it is not published to 0.0.0.0. Reach it through an SSH tunnel, or
+      # put a TLS-terminating reverse proxy in front of it.
+      - "${JENKINS_BIND_ADDRESS:-127.0.0.1}:${JENKINS_PORT:-8080}:8080"
+      # Port 50000 (inbound JNLP agents) is deliberately NOT published. All
+      # build work happens in containers on the DinD daemon, so no external
+      # agent ever needs to dial in.
+
+    volumes:
+      # Jenkins configuration, job definitions, credentials store and build
+      # logs. This is the volume that must survive a redeploy.
+      - jenkins-data:/var/jenkins_home
+      # Client certificates, read-only: the controller needs to present them,
+      # never to rewrite them.
+      - jenkins-certs:/certs/client:ro
+      # Archived build artefacts (scan reports, test results) on their own
+      # volume so log retention policy and artefact retention can be managed
+      # - and backed up - independently.
+      - build-artifacts:/var/jenkins_home/artifacts
+
+    # Defence in depth: stop any process in this container from gaining
+    # privileges through setuid binaries, and cap resource use so a runaway
+    # build cannot take the host down.
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - ci
+
+# -----------------------------------------------------------------------------
+#  Named volumes - managed by Docker, survive `docker compose down`.
+#  NOTE: `docker compose down -v` destroys all of these, including every job
+#  and build record. Do not use -v once the pipeline exists.
+# -----------------------------------------------------------------------------
+volumes:
+  jenkins-data:       # /var/jenkins_home: config, jobs, credentials, build logs
+  jenkins-certs:      # TLS client material generated by the DinD daemon
+  build-cache:        # /var/lib/docker inside DinD: image layers, build cache
+  build-artifacts:    # archived pipeline artefacts
+
+# -----------------------------------------------------------------------------
+#  Network - a dedicated bridge shared only by these two services. Keeping the
+#  stack off the default bridge means unrelated containers on the host cannot
+#  reach the build daemon or the controller.
+# -----------------------------------------------------------------------------
+networks:
+  ci:
+    driver: bridge
+    name: isec6000-ci
